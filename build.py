@@ -6,12 +6,14 @@ import getpass
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parent
@@ -440,6 +442,189 @@ def run_cmd(cmd: list[str], **kwargs) -> tuple[bool, str]:
         return False, str(e)
 
 
+def _redaction_tokens() -> list[str]:
+    """Return local-only values that must not be written to diagnostic metadata."""
+    values: set[str] = set()
+
+    path_values = [
+        ROOT,
+        Path.home(),
+        Path(tempfile.gettempdir()),
+    ]
+    for env_key in ("TMP", "TEMP", "TMPDIR"):
+        env_value = os.environ.get(env_key)
+        if env_value:
+            path_values.append(Path(env_value))
+
+    for path in path_values:
+        try:
+            resolved = path.resolve()
+        except (OSError, AttributeError):
+            resolved = path
+        for candidate in {str(path), path.as_posix(), str(resolved), resolved.as_posix()}:
+            if candidate:
+                values.add(candidate)
+                values.add(candidate.replace("\\", "/"))
+
+    for env_key in ("USER", "USERNAME", "LOGNAME"):
+        env_value = os.environ.get(env_key)
+        if env_value:
+            values.add(env_value)
+
+    for value in (getpass.getuser(), platform.node()):
+        if value:
+            values.add(value)
+
+    return sorted((value for value in values if value), key=len, reverse=True)
+
+
+def _redaction_patterns() -> list[re.Pattern[str]]:
+    """Share matching rules between redaction and validation on every host."""
+    windows_context = bool(PureWindowsPath(str(ROOT)).drive)
+    patterns = []
+    for token in _redaction_tokens():
+        pattern = re.escape(token)
+        if "/" not in token and "\\" not in token:
+            # A short identity such as `me` must not match `metadata` or `memory`.
+            pattern = rf"(?<![\w.-]){pattern}(?![\w.-])"
+        flags = re.IGNORECASE if windows_context or PureWindowsPath(token).drive else 0
+        patterns.append(re.compile(pattern, flags))
+    return patterns
+
+
+def redact_diagnostic_text(value: str) -> str:
+    """Redact local paths, usernames, and hostnames from diagnostic metadata text."""
+    redacted = value
+    for pattern in _redaction_patterns():
+        redacted = pattern.sub("<redacted>", redacted)
+    return redacted
+
+
+def repo_relative_metadata_path(path: Optional[str]) -> Optional[str]:
+    """Return a repository-relative `/` path, or omit an external artifact."""
+    if path is None:
+        return None
+
+    try:
+        if PureWindowsPath(str(ROOT)).drive:
+            root = PureWindowsPath(str(ROOT))
+            path_obj = PureWindowsPath(path)
+            relpath = (path_obj if path_obj.is_absolute() else root / path_obj).relative_to(root)
+            if ".." in relpath.parts:
+                return None
+        else:
+            if PureWindowsPath(path).drive:
+                return None
+            path_obj = Path(path.replace("\\", "/"))
+            if not path_obj.is_absolute():
+                path_obj = ROOT / path_obj
+            relpath = path_obj.resolve().relative_to(ROOT.resolve())
+        return relpath.as_posix()
+    except (OSError, ValueError):
+        return None
+
+
+def _iter_metadata_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _iter_metadata_strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_metadata_strings(nested)
+
+
+def validate_diagnostic_metadata(metadata_path: Path, root: Path = ROOT) -> list[str]:
+    """Validate JSON redaction and artifact pairing, without decrypting artifacts."""
+    errors: list[str] = []
+    if not metadata_path.exists():
+        return [f"diagnostic metadata is missing: {metadata_path}"]
+
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return [f"diagnostic metadata is not valid JSON: {exc}"]
+    if not isinstance(metadata, dict):
+        return ["diagnostic metadata must be a JSON object"]
+
+    name_match = re.fullmatch(r"build-([0-9a-fA-F]{8})(?:-metadata)?", metadata_path.stem)
+    if not name_match:
+        errors.append("diagnostic metadata filename must identify the build commit")
+    commit_id = name_match.group(1) if name_match else None
+    if commit_id is not None and metadata.get("commit", commit_id) != commit_id:
+        errors.append("diagnostic metadata commit mismatches its filename")
+
+    logd_value = metadata.get("diagnostic_logd")
+    if isinstance(logd_value, str) and logd_value:
+        logd_paths = [logd_value]
+    elif isinstance(logd_value, list) and logd_value and all(isinstance(item, str) and item for item in logd_value):
+        logd_paths = logd_value
+    else:
+        logd_paths = []
+        errors.append("diagnostic_logd must be a relative .logd path or a list of relative .logd paths")
+
+    if len(set(logd_paths)) != len(logd_paths):
+        errors.append("diagnostic_logd contains duplicate artifacts")
+
+    for index, relpath in enumerate(logd_paths, start=1):
+        relative = PurePosixPath(relpath)
+        if "\\" in relpath:
+            errors.append("diagnostic_logd uses backslashes instead of `/`")
+            continue
+        if relative.is_absolute() or PureWindowsPath(relpath).drive:
+            errors.append("diagnostic_logd must be repository-relative")
+            continue
+        if ".." in relative.parts:
+            errors.append("diagnostic_logd must not traverse outside the repository")
+            continue
+        if len(relative.parts) != 2 or relative.parts[0] != "diagnostic":
+            errors.append("diagnostic_logd must identify an artifact in diagnostic/")
+            continue
+        if relative.suffix != ".logd":
+            errors.append("diagnostic_logd must point to a .logd artifact")
+            continue
+        if commit_id is not None:
+            suffix = f"-part{index:03d}" if len(logd_paths) > 1 or metadata.get("chunked") else ""
+            if relative.name != f"build-{commit_id}{suffix}.logd":
+                errors.append("diagnostic_logd mismatches the metadata commit or ordered chunk sequence")
+        artifact_path = root / relative
+        try:
+            artifact_path.resolve().relative_to(root.resolve())
+            if not artifact_path.is_file():
+                errors.append("diagnostic_logd artifact is missing or is not a file")
+            elif artifact_path.stat().st_size == 0:
+                errors.append("diagnostic_logd artifact is empty")
+        except ValueError:
+            errors.append("diagnostic_logd resolves outside the repository")
+        except OSError:
+            errors.append("diagnostic_logd artifact cannot be read")
+
+    sensitive_patterns = _redaction_patterns()
+    for text_value in _iter_metadata_strings(metadata):
+        for pattern in sensitive_patterns:
+            if pattern.search(text_value):
+                errors.append("diagnostic metadata leaks a local path or identity")
+                break
+
+    modules = metadata.get("modules", [])
+    if not isinstance(modules, list):
+        errors.append("diagnostic modules must be a list")
+        modules = []
+    for module in modules:
+        if not isinstance(module, dict):
+            errors.append("diagnostic modules must contain objects")
+            continue
+        artifact = module.get("artifact")
+        if isinstance(artifact, str):
+            if "\\" in artifact:
+                errors.append("module artifact uses backslashes instead of `/`")
+            if PurePosixPath(artifact).is_absolute() or PureWindowsPath(artifact).drive or ".." in PurePosixPath(artifact).parts:
+                errors.append("module artifact must be repository-relative")
+
+    return errors
+
+
 def collect_system_info() -> str:
     lines = [
         "Tent of Trials - System Diagnostic Snapshot",
@@ -490,6 +675,8 @@ def build_diagnostic_report(
     chunked: bool = False,
     message_blocker: Optional[str] = None,
 ) -> dict:
+    if logd_relpaths:
+        logd_relpaths = [path.replace("\\", "/") for path in logd_relpaths]
     diagnostic_logd: Optional[str | list[str]]
     if not logd_relpaths:
         diagnostic_logd = None
@@ -500,14 +687,14 @@ def build_diagnostic_report(
 
     decrypt_target = logd_relpaths[0] if logd_relpaths and len(logd_relpaths) == 1 else None
     if logd_relpaths and len(logd_relpaths) > 1:
-        decrypt_target = str((DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT))
+        decrypt_target = (DIAGNOSTIC_DIR / f"build-{commit_id}.logd").relative_to(ROOT).as_posix()
 
     report = {
         "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "commit": commit_id,
         "diagnostic_logd": diagnostic_logd,
-        "diagnostic_logd_error": logd_error,
-        "message_blocker": message_blocker,
+        "diagnostic_logd_error": redact_diagnostic_text(logd_error) if logd_error else logd_error,
+        "message_blocker": redact_diagnostic_text(message_blocker) if message_blocker else message_blocker,
         "chunked": chunked,
         "chunk_size_bytes": DIAGNOSTIC_CHUNK_SIZE if chunked else None,
         "password": password,
@@ -523,8 +710,8 @@ def build_diagnostic_report(
                 "name": name,
                 "status": "PASS" if success else "FAIL",
                 "elapsed_seconds": round(elapsed, 3),
-                "artifact": binary,
-                "output": output,
+                "artifact": repo_relative_metadata_path(binary),
+                "output": redact_diagnostic_text(output),
             }
             for name, success, elapsed, output, binary in results
         ],
@@ -631,7 +818,7 @@ def generate_logd(
         safe_dir.mkdir(parents=True, exist_ok=True)
 
         (safe_dir / "system-info.txt").write_text(
-            collect_system_info(), encoding="utf-8"
+            redact_diagnostic_text(collect_system_info()), encoding="utf-8"
         )
 
         summary_lines = [
@@ -647,7 +834,7 @@ def generate_logd(
         for name, success, elapsed, _, binary in results:
             summary_lines.append(
                 f"  {name}: {'PASS' if success else 'FAIL'} ({elapsed:.2f}s)"
-                f"{f' [{binary}]' if binary else ''}"
+                f"{f' [{repo_relative_metadata_path(binary)}]' if binary else ''}"
             )
         (safe_dir / "build-summary.txt").write_text(
             "\n".join(summary_lines), encoding="utf-8"
@@ -660,9 +847,9 @@ def generate_logd(
                 f"{'=' * 50}"
             )
             if binary:
-                log_lines.append(f"artifact: {binary}")
+                log_lines.append(f"artifact: {repo_relative_metadata_path(binary)}")
             if output:
-                log_lines.append(output)
+                log_lines.append(redact_diagnostic_text(output))
         (safe_dir / "build.log").write_text("\n".join(log_lines), encoding="utf-8")
 
         sr = subprocess.run(
@@ -703,7 +890,7 @@ def generate_logd(
 
         safe_pw = sr.stdout.strip()
         logd_files = split_diagnostic_logd(logd_path)
-        logd_relpaths = [str(path.relative_to(ROOT)) for path in logd_files]
+        logd_relpaths = [path.relative_to(ROOT).as_posix() for path in logd_files]
         decrypt_target = logd_relpaths[0] if len(logd_relpaths) == 1 else str(logd_path.relative_to(ROOT))
         write_diagnostic_report(
             metadata_path,
